@@ -392,7 +392,7 @@ Please provide a comprehensive answer based on the available information."""
             {"source": doc.metadata.get("file_name", "unknown"), "content": doc.page_content[:200] + "..."}
             for doc in docs
         ]
-
+        logger.info(f"Result: {content}")
         return QueryResponse(
             answer=content,
         )
