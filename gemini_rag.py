@@ -386,7 +386,7 @@ Please provide a comprehensive answer based on the available information."""
             "i don't know",
             "empty"
         ]):
-            content = "empty"
+            content = ""
 
         documents = [
             {"source": doc.metadata.get("file_name", "unknown"), "content": doc.page_content[:200] + "..."}
