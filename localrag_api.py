@@ -209,4 +209,5 @@ def query_rag(req: QueryRequest):
     with cache_lock:
         query_cache[key] = answer
     print(f"Query: {req.query} | Answer: {answer}")
+
     return {"answer": answer}

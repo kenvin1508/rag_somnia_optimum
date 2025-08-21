@@ -7,7 +7,7 @@ __pycache__/
 *.so
 
 # Virtual environments
-env/
+.env/
 venv/
 X/           # nếu bạn tạo env tên X như ví dụ của bạn
 .venv/
