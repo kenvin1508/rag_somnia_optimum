@@ -17,17 +17,16 @@ from pydantic import BaseModel
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)  # Chỉ log INFO trở lên cho ứng dụng
-logging.getLogger('urllib3').setLevel(logging.WARNING)  # Tắt log chi tiết từ urllib3
-logging.getLogger('langchain').setLevel(logging.WARNING)  # Tắt log chi tiết từ langchain
-logging.getLogger('qdrant_client').setLevel(logging.WARNING)  # Tắt log chi tiết từ qdrant_client
-logging.getLogger('agno').setLevel(logging.WARNING)  # Tắt log chi tiết từ agno
+logger.setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('langchain').setLevel(logging.WARNING)
+logging.getLogger('qdrant_client').setLevel(logging.WARNING)
+logging.getLogger('agno').setLevel(logging.WARNING)
 
 # Hard-coded configurations
-GOOGLE_API_KEY = "AIzaSyBawZkl-ndb38sxze7uye_NLjDhuS3zFLk"  # Thay bằng key thật
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.0Y8ITL3SF-maASxQ0qtlnONHCsF7mkD9vLzGO79jxw0"  # Thay bằng key thật
-QDRANT_URL = "https://2f9b4767-59d5-4dd1-bf47-0745875beb91.us-west-1-0.aws.cloud.qdrant.io"  # Thay bằng URL thật
-FILE_PATH = "messages.txt"  # Thay bằng đường dẫn thực tế đến messages.txt
+QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.0Y8ITL3SF-maASxQ0qtlnONHCsF7mkD9vLzGO79jxw0"
+QDRANT_URL = "https://2f9b4767-59d5-4dd1-bf47-0745875beb91.us-west-1-0.aws.cloud.qdrant.io"
+FILE_PATH = "messages.txt"
 COLLECTION_NAME = "gemini-thinking-agent-agno"
 
 QUERY_REWRITER_INSTRUCTIONS = (
@@ -51,9 +50,9 @@ SYSTEM_MESSAGE = (
 
 # Embedding configuration
 class GeminiEmbedder(Embeddings):
-    def __init__(self, model_name="models/text-embedding-004"):
+    def __init__(self, model_name="models/text-embedding-004", api_key=None):
         try:
-            genai.configure(api_key=GOOGLE_API_KEY)
+            genai.configure(api_key=api_key)
             self.model = model_name
         except Exception as e:
             logger.error(f"Failed to configure Gemini API: {str(e)}")
@@ -92,11 +91,7 @@ class GeminiEmbedder(Embeddings):
             logger.error(f"Error embedding query: {str(e)}")
             raise e
 
-EMBEDDING_MODEL = GeminiEmbedder()
-EMBEDDING_DIM = 768  # Kích thước vector cho Gemini
-
 def check_qdrant_documents(client, identifier: str, source_type: str) -> bool:
-    """Check if documents exist in Qdrant."""
     try:
         key = "metadata.file_name" if source_type == "text" else "metadata.url"
         points = client.scroll(
@@ -113,7 +108,6 @@ def check_qdrant_documents(client, identifier: str, source_type: str) -> bool:
         return False
 
 def init_qdrant():
-    """Initialize Qdrant client and vector store."""
     try:
         client = QdrantClient(
             url=QDRANT_URL,
@@ -127,9 +121,8 @@ def init_qdrant():
                 vector_store = QdrantVectorStore(
                     client=client,
                     collection_name=COLLECTION_NAME,
-                    embedding=EMBEDDING_MODEL
+                    embedding=GeminiEmbedder()
                 )
-                # Ensure indexes for metadata
                 client.create_payload_index(
                     collection_name=COLLECTION_NAME,
                     field_name="metadata.file_name",
@@ -155,19 +148,16 @@ def init_qdrant():
 
 def clean_text(text: str) -> str:
     import re
-    # Xóa khoảng trắng thừa và ký tự đặc biệt không mong muốn
     text = re.sub(r'\s+', ' ', text.strip())
-    text = re.sub(r'[^\w\s,.?!]', '', text)  # Giữ chữ, số, dấu câu cơ bản
+    text = re.sub(r'[^\w\s,.?!]', '', text)
     return text
 
 def process_text(file_path: str) -> List:
-    """Process and clean text file, add source metadata."""
     try:
         logger.info(f"Processing text file: {file_path}")
         loader = TextLoader(file_path, encoding='utf-8')
         documents = loader.load()
         
-        # Clean text content
         for doc in documents:
             doc.page_content = clean_text(doc.page_content)
             doc.metadata.update({
@@ -188,15 +178,12 @@ def process_text(file_path: str) -> List:
         logger.error(f"Text processing error: {str(e)}")
         print(f"Error processing text file: {str(e)}")
         return []
-    
+
 def add_new_data_to_qdrant(file_path: str, collection_name: str = "gemini-thinking-agent-agno") -> bool:
-    """Add new data to existing Qdrant collection."""
     try:
-        # Initialize Qdrant client
         client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
         logger.info(f"Connected to Qdrant for adding data to {collection_name}")
 
-        # Process new text file
         file_name = os.path.basename(file_path)
         if not check_qdrant_documents(client, file_name, "text"):
             texts = process_text(file_path)
@@ -204,14 +191,12 @@ def add_new_data_to_qdrant(file_path: str, collection_name: str = "gemini-thinki
                 logger.error(f"No valid chunks created from {file_path}")
                 return False
 
-            # Initialize vector store for existing collection
             vector_store = QdrantVectorStore(
                 client=client,
                 collection_name=collection_name,
-                embedding=EMBEDDING_MODEL
+                embedding=GeminiEmbedder()
             )
 
-            # Add new documents in batches
             batch_size = 100
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i + batch_size]
@@ -227,16 +212,15 @@ def add_new_data_to_qdrant(file_path: str, collection_name: str = "gemini-thinki
         logger.error(f"Error adding new data to Qdrant: {str(e)}")
         print(f"Error adding new data: {str(e)}")
         return False
-    
+
 def create_vector_store(client, texts):
-    """Create and initialize vector store with documents."""
     try:
         logger.info(f"Creating vector store for {len(texts)} documents")
         try:
             client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(
-                    size=EMBEDDING_DIM,
+                    size=768,
                     distance=Distance.COSINE
                 )
             )
@@ -260,7 +244,7 @@ def create_vector_store(client, texts):
         vector_store = QdrantVectorStore(
             client=client,
             collection_name=COLLECTION_NAME,
-            embedding=EMBEDDING_MODEL
+            embedding=GeminiEmbedder()
         )
         
         logger.info("Adding documents to vector store")
@@ -275,7 +259,8 @@ def create_vector_store(client, texts):
         print(f"Vector store error: {str(e)}")
         return None
 
-def get_query_rewriter_agent() -> Agent:
+def get_query_rewriter_agent(api_key: str) -> Agent:
+    genai.configure(api_key=api_key)
     return Agent(
         name="Query Rewriter",
         model=Gemini(id="gemini-2.0-flash"),
@@ -284,7 +269,8 @@ def get_query_rewriter_agent() -> Agent:
         markdown=True,
     )
 
-def get_rag_agent() -> Agent:
+def get_rag_agent(api_key: str) -> Agent:
+    genai.configure(api_key=api_key)
     return Agent(
         name="Gemini RAG Agent",
         model=Gemini(id="gemini-2.0-flash"),
@@ -294,7 +280,6 @@ def get_rag_agent() -> Agent:
     )
 
 def check_document_relevance(query: str, vector_store, threshold: float = 0.7) -> tuple[bool, List]:
-    """Check if documents in vector store are relevant to the query."""
     if not vector_store:
         return False, []
     retriever = vector_store.as_retriever(
@@ -309,16 +294,13 @@ app = FastAPI(title="RAG Q&A API")
 
 class QueryRequest(BaseModel):
     question: str
+    gemini_api_token: str
 
 class QueryResponse(BaseModel):
     answer: str
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize Qdrant and vector store on FastAPI startup."""
-    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-    genai.configure(api_key=GOOGLE_API_KEY)
-    
     global qdrant_client, vector_store
     qdrant_client, vector_store = init_qdrant()
     if not qdrant_client:
@@ -350,9 +332,8 @@ async def startup_event():
 
 @app.post("/query", response_model=QueryResponse)
 async def query_rag(request: QueryRequest):
-    """Handle query requests via API."""
     try:
-        query_rewriter = get_query_rewriter_agent()
+        query_rewriter = get_query_rewriter_agent(request.gemini_api_token)
         rewritten_query = query_rewriter.run(request.question).content
         logger.info(f"Rewritten query: {rewritten_query}")
 
@@ -364,7 +345,7 @@ async def query_rag(request: QueryRequest):
                 context = "\n\n".join([d.page_content for d in docs])
                 logger.info(f"Found {len(docs)} relevant documents")
 
-        rag_agent = get_rag_agent()
+        rag_agent = get_rag_agent(request.gemini_api_token)
         if context:
             full_prompt = f"""Context: {context}
 
@@ -401,9 +382,8 @@ Please provide a comprehensive answer based on the available information."""
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 def main():
-    """Main function to run the console-based RAG application."""
-    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-    genai.configure(api_key=GOOGLE_API_KEY)
+    os.environ["GOOGLE_API_KEY"] = "AIzaSyBawZkl-ndb38sxze7uye_NLjDhuS3zFLk"  # Fallback for console mode
+    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
     
     qdrant_client, vector_store = init_qdrant()
     if not qdrant_client:
@@ -440,7 +420,7 @@ def main():
             break
         
         try:
-            query_rewriter = get_query_rewriter_agent()
+            query_rewriter = get_query_rewriter_agent(os.environ["GOOGLE_API_KEY"])
             rewritten_query = query_rewriter.run(prompt).content
             print(f"Original query: {prompt}")
             print(f"Rewritten query: {rewritten_query}")
@@ -457,7 +437,7 @@ def main():
                 print(f"Found {len(docs)} relevant documents")
         
         try:
-            rag_agent = get_rag_agent()
+            rag_agent = get_rag_agent(os.environ["GOOGLE_API_KEY"])
             if context:
                 full_prompt = f"""Context: {context}
 
