@@ -11,9 +11,8 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langchain_core.embeddings import Embeddings
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
-
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -51,15 +50,14 @@ SYSTEM_MESSAGE = (
 # Embedding configuration
 class GeminiEmbedder(Embeddings):
     def __init__(self, model_name="models/text-embedding-004", api_key=None):
-        try:
-            genai.configure(api_key=api_key)
-            self.model = model_name
-        except Exception as e:
-            logger.error(f"Failed to configure Gemini API: {str(e)}")
-            raise e
+        self.model = model_name
+        self.api_key = api_key
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         try:
+            if not self.api_key:
+                raise ValueError("No API key provided for Gemini")
+            genai.configure(api_key=self.api_key)
             embeddings = []
             total_texts = len(texts)
             logger.info(f"Embedding {total_texts} text chunks with Gemini")
@@ -77,6 +75,9 @@ class GeminiEmbedder(Embeddings):
 
     def embed_query(self, text: str) -> List[float]:
         try:
+            if not self.api_key:
+                raise ValueError("No API key provided for Gemini")
+            genai.configure(api_key=self.api_key)
             response = genai.embed_content(
                 model=self.model,
                 content=text,
@@ -116,28 +117,8 @@ def init_qdrant():
         )
         collections = client.get_collections().collections
         if any(c.name == COLLECTION_NAME for c in collections):
-            logger.info(f"Collection {COLLECTION_NAME} exists, initializing vector store")
-            try:
-                vector_store = QdrantVectorStore(
-                    client=client,
-                    collection_name=COLLECTION_NAME,
-                    embedding=GeminiEmbedder()
-                )
-                client.create_payload_index(
-                    collection_name=COLLECTION_NAME,
-                    field_name="metadata.file_name",
-                    field_schema="keyword"
-                )
-                client.create_payload_index(
-                    collection_name=COLLECTION_NAME,
-                    field_name="metadata.url",
-                    field_schema="keyword"
-                )
-                logger.info("Created payload indexes for metadata")
-                return client, vector_store
-            except Exception as e:
-                logger.error(f"Failed to initialize vector store: {str(e)}")
-                raise e
+            logger.info(f"Collection {COLLECTION_NAME} exists")
+            return client, None
         else:
             logger.info(f"Collection {COLLECTION_NAME} does not exist, will create when needed")
             return client, None
@@ -179,41 +160,30 @@ def process_text(file_path: str) -> List:
         print(f"Error processing text file: {str(e)}")
         return []
 
-def add_new_data_to_qdrant(file_path: str, collection_name: str = "gemini-thinking-agent-agno") -> bool:
+def process_text_content(content: str, file_name: str) -> List:
     try:
-        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
-        logger.info(f"Connected to Qdrant for adding data to {collection_name}")
-
-        file_name = os.path.basename(file_path)
-        if not check_qdrant_documents(client, file_name, "text"):
-            texts = process_text(file_path)
-            if not texts:
-                logger.error(f"No valid chunks created from {file_path}")
-                return False
-
-            vector_store = QdrantVectorStore(
-                client=client,
-                collection_name=collection_name,
-                embedding=GeminiEmbedder()
-            )
-
-            batch_size = 100
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                vector_store.add_documents(batch)
-                logger.info(f"Added batch {i // batch_size + 1} of {len(texts)} documents")
-            
-            logger.info(f"Successfully added {len(texts)} chunks from {file_name} to {collection_name}")
-            return True
-        else:
-            logger.info(f"File {file_name} already exists in {collection_name}")
-            return False
+        logger.info(f"Processing text content for: {file_name}")
+        from langchain_core.documents import Document
+        document = Document(page_content=clean_text(content), metadata={
+            "source_type": "text",
+            "file_name": file_name,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=5000,
+            chunk_overlap=50
+        )
+        chunks = text_splitter.split_documents([document])
+        chunks = [chunk for chunk in chunks if len(chunk.page_content.strip()) > 50]
+        logger.info(f"Created {len(chunks)} chunks from uploaded text")
+        return chunks
     except Exception as e:
-        logger.error(f"Error adding new data to Qdrant: {str(e)}")
-        print(f"Error adding new data: {str(e)}")
-        return False
+        logger.error(f"Text content processing error: {str(e)}")
+        print(f"Error processing text content: {str(e)}")
+        return []
 
-def create_vector_store(client, texts):
+def create_vector_store(client, texts, api_key: str):
     try:
         logger.info(f"Creating vector store for {len(texts)} documents")
         try:
@@ -244,7 +214,7 @@ def create_vector_store(client, texts):
         vector_store = QdrantVectorStore(
             client=client,
             collection_name=COLLECTION_NAME,
-            embedding=GeminiEmbedder()
+            embedding=GeminiEmbedder(api_key=api_key)
         )
         
         logger.info("Adding documents to vector store")
@@ -260,24 +230,32 @@ def create_vector_store(client, texts):
         return None
 
 def get_query_rewriter_agent(api_key: str) -> Agent:
-    genai.configure(api_key=api_key)
-    return Agent(
-        name="Query Rewriter",
-        model=Gemini(id="gemini-2.0-flash"),
-        instructions=QUERY_REWRITER_INSTRUCTIONS,
-        show_tool_calls=False,
-        markdown=True,
-    )
+    try:
+        genai.configure(api_key=api_key)
+        return Agent(
+            name="Query Rewriter",
+            model=Gemini(id="gemini-2.0-flash", api_key=api_key),
+            instructions=QUERY_REWRITER_INSTRUCTIONS,
+            show_tool_calls=False,
+            markdown=True,
+        )
+    except Exception as e:
+        logger.error(f"Error initializing query rewriter agent: {str(e)}")
+        raise e
 
 def get_rag_agent(api_key: str) -> Agent:
-    genai.configure(api_key=api_key)
-    return Agent(
-        name="Gemini RAG Agent",
-        model=Gemini(id="gemini-2.0-flash"),
-        instructions=SYSTEM_MESSAGE,
-        show_tool_calls=True,
-        markdown=True,
-    )
+    try:
+        genai.configure(api_key=api_key)
+        return Agent(
+            name="Gemini RAG Agent",
+            model=Gemini(id="gemini-2.0-flash", api_key=api_key),
+            instructions=SYSTEM_MESSAGE,
+            show_tool_calls=True,
+            markdown=True,
+        )
+    except Exception as e:
+        logger.error(f"Error initializing RAG agent: {str(e)}")
+        raise e
 
 def check_document_relevance(query: str, vector_store, threshold: float = 0.7) -> tuple[bool, List]:
     if not vector_store:
@@ -299,40 +277,57 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
 
+class UploadResponse(BaseModel):
+    message: str
+    file_name: str
+    chunks_added: int
+
 @app.on_event("startup")
 async def startup_event():
     global qdrant_client, vector_store
     qdrant_client, vector_store = init_qdrant()
     if not qdrant_client:
-        logger.error("Failed to connect to Qdrant during startup")
-        raise HTTPException(status_code=500, detail="Failed to connect to Qdrant")
+        logger.warning("Failed to connect to Qdrant, API will run without vector store")
+        print("Failed to connect to Qdrant, API will run without vector store")
     
     file_name = os.path.basename(FILE_PATH)
     if os.path.exists(FILE_PATH):
-        if not check_qdrant_documents(qdrant_client, file_name, "text"):
-            logger.info(f"Processing {file_name} during startup")
-            texts = process_text(FILE_PATH)
-            if texts:
-                if vector_store:
-                    logger.info(f"Adding {len(texts)} chunks to vector store")
-                    batch_size = 100
-                    for i in range(0, len(texts), batch_size):
-                        batch = texts[i:i + batch_size]
-                        vector_store.add_documents(batch)
-                else:
-                    vector_store = create_vector_store(qdrant_client, texts)
-                logger.info(f"Added file: {file_name}")
-            else:
-                logger.error(f"Failed to process {file_name}")
-        else:
-            logger.info(f"File {file_name} already processed in Qdrant")
+        logger.info(f"File {file_name} found, deferring processing until query with API key")
     else:
         logger.error(f"File {FILE_PATH} not found")
-        raise HTTPException(status_code=400, detail=f"File {FILE_PATH} not found")
+        print(f"File {FILE_PATH} not found")
 
 @app.post("/query", response_model=QueryResponse)
 async def query_rag(request: QueryRequest):
     try:
+        # Validate API key
+        try:
+            test_embedder = GeminiEmbedder(api_key=request.gemini_api_token)
+            test_embedder.embed_query("test")
+        except Exception as e:
+            logger.error(f"Invalid Gemini API key: {str(e)}")
+            raise HTTPException(status_code=401, detail="Invalid Gemini API key")
+
+        # Initialize vector store if not already done
+        global vector_store
+        file_name = os.path.basename(FILE_PATH)
+        if vector_store is None and qdrant_client and os.path.exists(FILE_PATH):
+            if not check_qdrant_documents(qdrant_client, file_name, "text"):
+                logger.info(f"Processing {file_name} with provided API key")
+                texts = process_text(FILE_PATH)
+                if texts:
+                    vector_store = create_vector_store(qdrant_client, texts, request.gemini_api_token)
+                    logger.info(f"Added file: {file_name}")
+                else:
+                    logger.error(f"Failed to process {file_name}")
+            else:
+                logger.info(f"File {file_name} already processed in Qdrant")
+                vector_store = QdrantVectorStore(
+                    client=qdrant_client,
+                    collection_name=COLLECTION_NAME,
+                    embedding=GeminiEmbedder(api_key=request.gemini_api_token)
+                )
+
         query_rewriter = get_query_rewriter_agent(request.gemini_api_token)
         rewritten_query = query_rewriter.run(request.question).content
         logger.info(f"Rewritten query: {rewritten_query}")
@@ -344,6 +339,10 @@ async def query_rag(request: QueryRequest):
             if has_docs:
                 context = "\n\n".join([d.page_content for d in docs])
                 logger.info(f"Found {len(docs)} relevant documents")
+            else:
+                logger.info("No relevant documents found")
+        else:
+            logger.warning("No vector store available, answering without context")
 
         rag_agent = get_rag_agent(request.gemini_api_token)
         if context:
@@ -355,7 +354,6 @@ Rewritten Question: {rewritten_query}
 Please provide a comprehensive answer based on the available information."""
         else:
             full_prompt = f"Original Question: {request.question}\nRewritten Question: {rewritten_query}"
-            logger.info("No relevant documents found")
 
         response = rag_agent.run(full_prompt)
         content = response.content.strip()
@@ -369,10 +367,6 @@ Please provide a comprehensive answer based on the available information."""
         ]):
             content = ""
 
-        documents = [
-            {"source": doc.metadata.get("file_name", "unknown"), "content": doc.page_content[:200] + "..."}
-            for doc in docs
-        ]
         logger.info(f"Result: {content}")
         return QueryResponse(
             answer=content,
@@ -381,8 +375,73 @@ Please provide a comprehensive answer based on the available information."""
         logger.error(f"Error processing query: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
+@app.post("/upload", response_model=UploadResponse)
+async def upload_text_file(file: UploadFile = File(...), gemini_api_token: str = Form(...)):
+    try:
+        # Validate API key
+        if not gemini_api_token:
+            logger.error("No Gemini API key provided")
+            raise HTTPException(status_code=400, detail="Gemini API key is required")
+        
+        try:
+            test_embedder = GeminiEmbedder(api_key=gemini_api_token)
+            test_embedder.embed_query("test")
+        except Exception as e:
+            logger.error(f"Invalid Gemini API key: {str(e)}")
+            raise HTTPException(status_code=401, detail="Invalid Gemini API key")
+
+        # Validate file type
+        if not file.filename.endswith('.txt'):
+            logger.error(f"Invalid file type: {file.filename}. Only .txt files are supported")
+            raise HTTPException(status_code=400, detail="Only .txt files are supported")
+
+        # Read file content
+        content = await file.read()
+        try:
+            content = content.decode('utf-8')
+        except UnicodeDecodeError:
+            logger.error(f"File {file.filename} is not a valid UTF-8 text file")
+            raise HTTPException(status_code=400, detail="File must be a valid UTF-8 text file")
+
+        # Check if file already exists in Qdrant
+        if not qdrant_client:
+            logger.error("Qdrant client not initialized")
+            raise HTTPException(status_code=500, detail="Qdrant client not initialized")
+
+        if check_qdrant_documents(qdrant_client, file.filename, "text"):
+            logger.info(f"File {file.filename} already exists in Qdrant")
+            return UploadResponse(
+                message=f"File {file.filename} already exists in Qdrant",
+                file_name=file.filename,
+                chunks_added=0
+            )
+
+        # Process text content
+        texts = process_text_content(content, file.filename)
+        if not texts:
+            logger.error(f"Failed to process text content for {file.filename}")
+            raise HTTPException(status_code=500, detail="Failed to process text content")
+
+        # Create or update vector store
+        global vector_store
+        vector_store = create_vector_store(qdrant_client, texts, gemini_api_token)
+        if not vector_store:
+            logger.error(f"Failed to create vector store for {file.filename}")
+            raise HTTPException(status_code=500, detail="Failed to create vector store")
+
+        logger.info(f"Successfully uploaded and processed {file.filename}")
+        return UploadResponse(
+            message=f"Successfully uploaded and processed {file.filename}",
+            file_name=file.filename,
+            chunks_added=len(texts)
+        )
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
+
 def main():
-    os.environ["GOOGLE_API_KEY"] = "AIzaSyBawZkl-ndb38sxze7uye_NLjDhuS3zFLk"  # Fallback for console mode
+    if "GOOGLE_API_KEY" not in os.environ:
+        os.environ["GOOGLE_API_KEY"] = input("Enter Google API key: ")
     genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
     
     qdrant_client, vector_store = init_qdrant()
@@ -396,19 +455,17 @@ def main():
             print(f"Processing {file_name}...")
             texts = process_text(FILE_PATH)
             if texts:
-                if vector_store:
-                    logger.info(f"Adding {len(texts)} chunks to vector store")
-                    batch_size = 100
-                    for i in range(0, len(texts), batch_size):
-                        batch = texts[i:i + batch_size]
-                        vector_store.add_documents(batch)
-                else:
-                    vector_store = create_vector_store(qdrant_client, texts)
+                vector_store = create_vector_store(qdrant_client, texts, os.environ["GOOGLE_API_KEY"])
                 print(f"Added file: {file_name}")
             else:
                 print(f"Failed to process {file_name}")
         else:
             print(f"File {file_name} already processed in Qdrant")
+            vector_store = QdrantVectorStore(
+                client=qdrant_client,
+                collection_name=COLLECTION_NAME,
+                embedding=GeminiEmbedder(api_key=os.environ["GOOGLE_API_KEY"])
+            )
     else:
         print(f"File {FILE_PATH} not found")
         return
